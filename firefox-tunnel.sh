@@ -16,7 +16,7 @@ set -e
 #    bash firefox-tunnel.sh                     # 改端口 + VNC 密码
 #    bash firefox-tunnel.sh --dry-run           # 只打印将要执行的命令
 #
-#  需要先装好 Firefox: bash install-firefox.sh（本脚本会自动检测/引导）
+
 # =====================================================================
 
 # ---------- 颜色与日志 ----------
@@ -39,6 +39,7 @@ export VNC_PASSWORD=${VNC_PASSWORD:-''}   # VNC 连接密码（空 = 无密码�
 export VNC_PORT=${VNC_PORT:-'5900'}       # x11vnc 端口
 export DISPLAY_NUM=${DISPLAY_NUM:-':99'}  # 虚拟显示号
 export FIREFOX_BIN=${FIREFOX_BIN:-"$HOME/firefox/firefox"}
+export FIREFOX_LANG=${FIREFOX_LANG:-'en-US'}
 export NOVNC_DIR=${NOVNC_DIR:-"$HOME/noVNC"}
 export CF_BIN=${CF_BIN:-"$HOME/cloudflared"}
 
@@ -71,6 +72,25 @@ download_file() {
 }
 
 # ---------- 1. 确保 Firefox ----------
+install_firefox_from_cdn() {
+    local arch
+    case $(uname -m) in
+        x86_64|amd64)  arch="linux64" ;;
+        aarch64|arm64) arch="linux-aarch64" ;;
+        *) log_error "不支持的架构: $(uname -m)" ;;
+    esac
+    local url="https://download.mozilla.org/?product=firefox-latest&os=${arch}&lang=${FIREFOX_LANG}"
+    local tmp; tmp=$(mktemp -d)
+
+    log_info "从 Mozilla CDN 下载 Firefox ($arch / $FIREFOX_LANG) ..."
+    download_file "$url" "$tmp/firefox.tar.xz"
+    mkdir -p "$(dirname "$FIREFOX_BIN")"
+    tar -xJf "$tmp/firefox.tar.xz" -C "$(dirname "$FIREFOX_BIN")" --strip-components=1
+    chmod +x "$FIREFOX_BIN"
+    rm -rf "$tmp"
+    log_info "Firefox 已自动安装: $FIREFOX_BIN"
+}
+
 ensure_firefox() {
     if [[ -x "$FIREFOX_BIN" ]]; then
         log_info "Firefox: $FIREFOX_BIN"
@@ -78,15 +98,13 @@ ensure_firefox() {
         FIREFOX_BIN=$(command -v firefox)
         log_info "Firefox(系统): $FIREFOX_BIN"
     else
-        log_warn "未找到 Firefox，调用 install-firefox.sh 安装..."
+        log_warn "未找到 Firefox，开始自动安装..."
         if [[ -f ./install-firefox.sh ]]; then
+            # 同目录有独立安装脚本 → 优先用它
             bash ./install-firefox.sh
-        else
-            curl -fsSL -o /tmp/install-firefox.sh \
-                https://raw.githubusercontent.com/your/repo/install-firefox.sh 2>/dev/null \
-                && bash /tmp/install-firefox.sh || log_error "请先运行 install-firefox.sh"
         fi
-        [[ -x "$FIREFOX_BIN" ]] || log_error "Firefox 安装失败: $FIREFOX_BIN"
+        [[ -x "$FIREFOX_BIN" ]] || install_firefox_from_cdn
+        [[ -x "$FIREFOX_BIN" ]] || log_error "Firefox 自动安装失败: $FIREFOX_BIN"
     fi
 }
 
