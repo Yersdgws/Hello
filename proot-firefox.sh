@@ -198,7 +198,7 @@ ensure_rootfs() {
     # machine-id（firefox/dbus 需要)。
     # LXC rootfs 里 /etc/machine-id 是 0444(root:root) 只读文件，非 root 写入
     # 会 Permission denied → 先删除再重建（删文件只需目录写权限）。
-    local mid; mid=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    local mid; mid=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
     rm -f "$PROOTFS_DIR/etc/machine-id" "$PROOTFS_DIR/var/lib/dbus/machine-id"
     echo "$mid" > "$PROOTFS_DIR/etc/machine-id"
     mkdir -p "$PROOTFS_DIR/var/lib/dbus"
