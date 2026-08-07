@@ -2,25 +2,18 @@
 set -e
 
 # =====================================================================
-#  无 root 环境安装 Xvfb / x11vnc / python3 依赖（解包 .deb 到用户目录）
+#  无 root 环境安装 Xvfb / x11vnc / Firefox 的 GTK 依赖
+#  （apt-get download + dpkg-deb -x 解包到用户目录 + LD_LIBRARY_PATH）
 #
-#  原理: apt-get download（不需要 root，只要有网络和 apt 仓库）
-#        + dpkg-deb -x 解包到 $HOME/xroot
-#        + 运行时代码通过 LD_LIBRARY_PATH 指向解包出的库
-#
-#  适用: SAP BAS / 各类无 sudo 的云开发容器（Debian/Ubuntu 系）
+#  关键改进: 自动递归解析依赖闭包——不光下 xvfb/x11vnc 本身，
+#            还把 libvncserver1/libunwind8/libpangocairo/GTK 等
+#            传递依赖全部下载解包，避免运行时缺 .so。
 #
 #  用法:
-#     bash noroot-deps.sh                 # 装到 ~/xroot
-#
-#  装完导出的变量（或写入 ~/.bashrc）:
-#     export XROOT="$HOME/xroot"
-#     export LD_LIBRARY_PATH="$XROOT/usr/lib/x86_64-linux-gnu:$XROOT/usr/lib:$LD_LIBRARY_PATH"
-#     export PATH="$XROOT/usr/bin:$PATH"
-#  然后在 firefox-tunnel.sh 里用:  XVFB_BIN=~/xroot/usr/bin/Xvfb ...
+#     bash noroot-deps.sh        # 装到 ~/xroot
+#  装完 source 输出的 export 即可（或写进 ~/.bashrc）
 # =====================================================================
 
-# ---------- 日志 ----------
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -31,81 +24,120 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$PREFIX"
 
-# X server + x11vnc + 浏览器需要的库（Debian/Ubuntu 包名）
-PACKAGES="xvfb x11vnc xauth x11-xkb-utils x11-utils fontconfig \
-          libx11-6 libxext6 libxtst6 libxi6 libxrender1 libxft2 libxdamage1 \
-          libasound2 libdbus-glib-1-2 libgtk-3-0 libgdk-pixbuf-2.0-0 libglib2.0-0 \
-          libpango-1.0-0 libcairo2 libnspr4 libnss3 libpci3 libdrm2 libxfixes3"
+# 种子包：闭包会递归补齐全部依赖
+SEEDS="xvfb x11vnc xauth x11-xkb-utils xkb-data x11-utils fontconfig fonts-dejavu-core \
+       libgtk-3-0 libpangocairo-1.0-0 libasound2 libdbus-glib-1-2 libnss3 libnspr4"
 
-# ---------- 阶段1: 用系统已有的 apt 包列表下载（无 root 也可以读列表） ----------
-MISSING_DEBS=""
-down_system() {
-    for p in $PACKAGES; do
-        if apt-get download "$p" >/dev/null 2>&1; then
-            echo "  ok  $p"
-        else
-            echo "  miss $p"; MISSING_DEBS="$MISSING_DEBS $p"
-        fi
-    done
+# 下载/解包统一在临时目录进行（apt-get download 下到当前目录）
+cd "$TMP"
+
+# 不下载的系统核心库：直接用容器自带的，避免 glibc/编译器运行时版本冲突
+SKIP="libc6 libgcc-s1 libstdc++6 libgomp1 libitm1 libatomic1 libquadmath0 \
+      libtsan2 liblsan0 libubsan1 libasan8 libcc1-0 libgcc1"
+
+APT_OPTS=()        # 阶段1=空(系统源)；阶段2=指向临时 lists
+MISSING=""
+DL_COUNT=0
+
+# 一次下载（带系统源或临时源选项）
+dl() {
+    local p="$1"
+    if apt-get "${APT_OPTS[@]}" download "$p" >/dev/null 2>&1; then
+        DL_COUNT=$((DL_COUNT+1))
+        return 0
+    fi
+    return 1
 }
 
-# ---------- 阶段2：非 root 兜底 ----------
-#   把 apt 的 lists/cache 目录指到临时目录（不碰 /var，无需 root），
-#   临时写一个 Debian bookworm 源（[trusted=yes] 跳过 GPG 校验）。
-#   适用：容器里系统源可能没更新过包列表 / 或源本身访问不了。
-fallback_bookworm() {
-    local A="$TMP/apt"
-    mkdir -p "$A/lists/partial" "$A/cache/archives/partial"
-    echo "deb [trusted=yes] http://deb.debian.org/debian bookworm main" > "$A/sources.list"
-    local OPTS=(
-        -o "Dir::State::lists=$A/lists"
-        -o "Dir::Cache=$A/cache"
-        -o "Dir::Etc::sourcelist=$A/sources.list"
+# ---------- 阶段1：直接用系统 apt 源 ----------
+log_info "阶段1：用系统 apt 源下载种子包..."
+for p in $SEEDS; do
+    if dl "$p"; then
+        echo "  ok  $p"
+    else
+        MISSING="$MISSING $p"
+    fi
+done
+
+# ---------- 阶段2：非 root 临时源（bookworm, trusted=yes） ----------
+if [[ -n "$MISSING" ]]; then
+    log_warn "阶段1 缺:${MISSING}，改用非 root 的 Debian bookworm 源..."
+    local_apt="$TMP/apt"
+    mkdir -p "$local_apt/lists/partial" "$local_apt/cache/archives/partial"
+    echo "deb [trusted=yes] http://deb.debian.org/debian bookworm main" > "$local_apt/sources.list"
+    APT_OPTS=(
+        -o "Dir::State::lists=$local_apt/lists"
+        -o "Dir::Cache=$local_apt/cache"
+        -o "Dir::Etc::sourcelist=$local_apt/sources.list"
         -o "Dir::Etc::sourceparts=-"
         -o "APT::Get::List-Cleanup=0"
     )
-    echo "  非 root 更新 Debian bookworm 源..."
-    apt-get "${OPTS[@]}" update >/dev/null 2>&1 || { echo "  apt update 失败"; return 1; }
-    # 只补缺的包
-    for p in $MISSING_DEBS; do
-        if apt-get "${OPTS[@]}" download "$p" >/dev/null 2>&1; then
-            echo "  ok  $p (bookworm)"
-        else
-            echo "  miss $p"
-        fi
-    done
-}
-
-cd "$TMP"
-log_info "阶段1：用系统 apt 源下载..."
-down_system
-if [[ -n "$MISSING_DEBS" ]]; then
-    log_warn "阶段1 缺:${MISSING_DEBS}，进入阶段2（非 root bookworm 源）..."
-    if ! fallback_bookworm; then
+    echo "  非 root 更新 bookworm 源..."
+    apt-get "${APT_OPTS[@]}" update >/dev/null 2>&1 || {
         cat >&2 <<'EOD'
-[ERROR] apt update 也失败（多半 deb.debian.org 访问不了/被墙）。
-请在你的目标机器上手动诊断：
-    cat /etc/os-release
-    printf 'deb [trusted=yes] http://deb.debian.org/debian bookworm main\n' > /tmp/s.list
-    apt-get -o Dir::State::lists=/tmp/l -o Dir::Etc::sourcelist=/tmp/s.list update
-    curl -sI http://deb.debian.org/debian/dists/bookworm/Release | head -1
-    # 若有代理: export http_proxy=http://host:port https_proxy=... 再重跑
+[ERROR] apt update 失败（deb.debian.org 访问不了/被墙）。
+诊断：curl -sI http://deb.debian.org/debian/dists/bookworm/Release | head -1
+有代理就先 export http_proxy/https_proxy 再重跑。
 EOD
         exit 1
-    fi
+    }
+    for p in $MISSING; do
+        if dl "$p"; then echo "  ok  $p (bookworm)"; else echo "  skip $p"; fi
+    done
 fi
 
+# ---------- 依赖闭包：递归把每个包的全部 Depends 拉下来 ----------
+log_info "递归解析依赖闭包..."
+QUEUE="$SEEDS"
+DONE=""
+i=0
+while [[ -n "$QUEUE" ]]; do
+    i=$((i+1))
+    (( i > 40 )) && { log_warn "闭包迭代超限，停止"; break; }
+    NEXT=""
+    for p in $QUEUE; do
+        case " $DONE " in *" $p "*) continue;; esac
+        DONE="$DONE $p"
+        [[ " $SKIP " == *" $p "* ]] && continue
+        if dl "$p"; then
+            echo "  ok  $p"
+        else
+            echo "  -   $p (虚拟包/不存在，跳过)"
+        fi
+        # 收集 Depends/PreDepends（取第一个候选）
+        DEPS=$(apt-cache "${APT_OPTS[@]}" depends --no-recommends --no-suggests \
+               --no-conflicts --no-breaks --no-replaces --no-enhances "$p" 2>/dev/null \
+               | awk -F'[ :<>|]+' '/^  (Depends|PreDepends): /{print $3}')
+        NEXT="$NEXT $DEPS"
+    done
+    QUEUE="$NEXT"
+done
+
 # ---------- 解包 ----------
+log_info "解包 ${DL_COUNT} 个 .deb 到 $PREFIX ..."
 FOUND=0
 for f in *.deb; do
     [[ -f "$f" ]] || continue
     dpkg-deb -x "$f" "$PREFIX" 2>/dev/null && FOUND=1
 done
-[[ "$FOUND" = "0" ]] && log_error "仍然没有下到任何 .deb，请检查网络/代理"
+[[ "$FOUND" = "0" ]] && log_error "没有下到任何 .deb，请检查网络"
 
-# ---------- 整理库目录并给提示 ----------
+# ---------- 缺失库体检 ----------
 LIBDIR=$(find "$PREFIX/usr/lib" -maxdepth 1 -type d -name '*linux-gnu' | head -1)
 [[ -z "$LIBDIR" ]] && LIBDIR="$PREFIX/usr/lib"
+log_info "依赖体检（ldd）..."
+for bin in "$PREFIX/usr/bin/Xvfb" "$PREFIX/usr/bin/x11vnc"; do
+    [[ -x "$bin" ]] || continue
+    echo "-- $(basename "$bin")"
+    MISS=$(LD_LIBRARY_PATH="$LIBDIR:$PREFIX/usr/lib" ldd "$bin" 2>/dev/null | grep "not found" || true)
+    if [[ -n "$MISS" ]]; then
+        echo "$MISS"
+    else
+        echo "   依赖完整"
+    fi
+done
+
+# ---------- 输出提示 ----------
 echo
 echo -e "${GREEN}=========== 安装完成 ===========${NC}"
 echo "前缀目录 : $PREFIX"
@@ -116,10 +148,8 @@ echo "# 加入 ~/.bashrc 后 source:"
 echo "export LD_LIBRARY_PATH=\"$LIBDIR:$PREFIX/usr/lib:\$LD_LIBRARY_PATH\""
 echo "export PATH=\"$PREFIX/usr/bin:\$PATH\""
 echo
-echo "# 然后这样启动 firefox-tunnel.sh:"
+echo "# 然后启动:"
 echo "XVFB_BIN=\"$PREFIX/usr/bin/Xvfb\" \\"
 echo "X11VNC_BIN=\"$PREFIX/usr/bin/x11vnc\" \\"
 echo "PYTHON3_BIN=\"\$(command -v python3)\" \\"
 echo "bash firefox-tunnel.sh"
-echo
-echo "若 ldd 报缺 .so，把对应包名加进本脚本 PACKAGES 重跑即可。"
