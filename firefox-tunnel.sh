@@ -251,14 +251,22 @@ create_wrapper() {
     local x11vnc_cmd="$X11VNC_BIN -display $DISPLAY_NUM -forever -shared -rfbport $VNC_PORT -nopw"
     [[ -n "$VNC_PASSWORD" ]] && x11vnc_cmd="$X11VNC_BIN -display $DISPLAY_NUM -forever -shared -rfbport $VNC_PORT -passwd '$VNC_PASSWORD'"
 
-    # 无 root 解包目录(xroot)的库路径，注入 wrapper 环境
+    # 无 root 解包目录(xroot)的库路径。
+    # 关键：系统库目录放前面，xroot 放后面——系统已有的库用系统的（避免
+    # bookworm 旧版 libssl 等遮蔽系统新版导致 curl/动态库崩溃），
+    # xroot 只补系统没有的（libvncserver、libunwind 等）。
     local xroot_lib=""
     for d in "$XROOT/usr/lib/"*linux-gnu "$XROOT/usr/lib"; do
         [[ -d "$d" ]] && xroot_lib="$xroot_lib:${d}"
     done
     xroot_lib="${xroot_lib#:}"
+    local sys_lib=""
+    for d in /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib; do
+        [[ -d "$d" ]] && sys_lib="$sys_lib:$d"
+    done
+    sys_lib="${sys_lib#:}"
     local xroot_export=""
-    [[ -n "$xroot_lib" ]] && xroot_export="export LD_LIBRARY_PATH=\"$xroot_lib:\$LD_LIBRARY_PATH\""
+    [[ -n "$xroot_lib" ]] && xroot_export="export LD_LIBRARY_PATH=\"$sys_lib:$xroot_lib:\$LD_LIBRARY_PATH\""
 
     cat > "$wrapper" <<EOF
 #!/bin/bash
