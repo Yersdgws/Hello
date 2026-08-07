@@ -280,6 +280,11 @@ write_stack_sh() {
 export DISPLAY="$DISPLAY_NUM"
 export HOME=/root
 export XDG_RUNTIME_DIR=/tmp/xdg
+# proot 容器内无法建立进程沙箱 → 关掉,否则 NSS 库初始化失败
+# 报 SEC_ERROR_LIBRARY_FAILURE / 所有 HTTPS 打不开
+export MOZ_DISABLE_CONTENT_SANDBOX=1
+export MOZ_DISABLE_GPU_SANDBOX=1
+export MOZ_DISABLE_SANDBOX=1
 mkdir -p /tmp/xdg /root/.mozilla
 rm -f /tmp/.pid.xvfb /tmp/.pid.x11vnc /tmp/.pid.ff
 # 固定 profile, 每次全新 → 避免锁/损坏
@@ -289,6 +294,8 @@ rm -rf "\$PROF"; mkdir -p "\$PROF"
 cat > "\$PROF/user.js" <<'UJ'
 user_pref("network.dns.disableIPv6", true);
 user_pref("network.proxy.type", 0);
+user_pref("security.sandbox.content.level", 0);
+user_pref("security.sandbox.gpu.level", 0);
 UJ
 
 start_xvfb()   { Xvfb "$DISPLAY_NUM" -screen 0 1280x800x24 -nolisten tcp >/tmp/xvfb.log 2>&1 & echo \$! > /tmp/.pid.xvfb; }
