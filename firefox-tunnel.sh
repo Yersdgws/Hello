@@ -181,18 +181,26 @@ EOF
 
 # ---------- 3. noVNC（网页版 VNC 客户端） ----------
 ensure_novnc() {
-    if [[ -f "$NOVNC_DIR/vnc.html" ]]; then
+    if [[ -f "$NOVNC_DIR/vnc.html" && -f "$NOVNC_DIR/utils/websockify.py" ]]; then
         log_info "noVNC: $NOVNC_DIR"
         return 0
     fi
     local tmp; tmp=$(mktemp -d)
     local url="https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.tar.gz"
     log_info "下载 noVNC ..."
-    download_file "$url" "$tmp/novnc.tar.gz"
-    mkdir -p "$NOVNC_DIR"
-    tar -xzf "$tmp/novnc.tar.gz" -C "$tmp"
-    cp -r "$tmp"/noVNC-1.5.0/* "$NOVNC_DIR/"
+    if download_file "$url" "$tmp/novnc.tar.gz"; then
+        mkdir -p "$NOVNC_DIR"
+        tar -xzf "$tmp/novnc.tar.gz" -C "$tmp" && cp -r "$tmp"/noVNC-1.5.0/* "$NOVNC_DIR/"
+    fi
+    # tar 解压失败 / GitHub 下载失败 → git 兜底
+    if [[ ! -f "$NOVNC_DIR/vnc.html" ]]; then
+        log_warn "tar 下载/解压失败，改用 git clone 兜底 ..."
+        rm -rf "$NOVNC_DIR"
+        git clone --depth 1 --branch v1.5.0 https://github.com/novnc/noVNC.git "$NOVNC_DIR" \
+            || log_error "noVNC 下载失败: $url（请检查网络后重跑）"
+    fi
     chmod +x "$NOVNC_DIR/utils/launch.sh" 2>/dev/null || true
+    [[ -f "$NOVNC_DIR/vnc.html" ]] || log_error "noVNC 目录不完整: $NOVNC_DIR"
     rm -rf "$tmp"
     log_info "noVNC 就绪: $NOVNC_DIR"
 }
@@ -211,23 +219,25 @@ ensure_cloudflared() {
 build_tunnel_args() {
     local gotty_port="$1"
 
+    # 注意：本函数 stdout 必须只输出"隧道参数"，日志一律走 stderr，
+    # 否则 $(build_tunnel_args) 会把日志混进参数，导致 wrapper 命令被拆烂。
     if [[ -n "$ARGO_AUTH" && -n "$ARGO_DOMAIN" ]]; then
         if [[ "$ARGO_AUTH" =~ TunnelSecret ]]; then
             local config_file="$(pwd)/tunnel.yml"
             printf '%s\n' "$ARGO_AUTH" > "$config_file"
             chmod 600 "$config_file"
-            log_info "识别为 JSON 配置固定隧道模式，已生成 $config_file"
+            log_info "识别为 JSON 配置固定隧道模式，已生成 $config_file" >&2
             echo "tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --config $config_file run"
         else
             if [[ "$ARGO_AUTH" =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-                log_info "识别为固定隧道 Token 模式"
+                log_info "识别为固定隧道 Token 模式" >&2
             else
-                log_warn "ARGO_AUTH 格式无法识别，将尝试作为 Token 使用"
+                log_warn "ARGO_AUTH 格式无法识别，将尝试作为 Token 使用" >&2
             fi
             echo "tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}"
         fi
     else
-        log_info "临时隧道模式（随机 trycloudflare 域名，仅供测试）"
+        log_info "临时隧道模式（随机 trycloudflare 域名，仅供测试）" >&2
         echo "tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --url http://localhost:$gotty_port"
     fi
 }
