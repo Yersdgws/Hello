@@ -198,7 +198,7 @@ ensure_rootfs() {
     # machine-id（firefox/dbus 需要)。
     # LXC rootfs 里 /etc/machine-id 是 0444(root:root) 只读文件，非 root 写入
     # 会 Permission denied → 先删除再重建（删文件只需目录写权限）。
-    local mid; mid=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    local mid; mid=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')   # 32 hex 字符，D-Bus 要求
     rm -f "$PROOTFS_DIR/etc/machine-id" "$PROOTFS_DIR/var/lib/dbus/machine-id"
     echo "$mid" > "$PROOTFS_DIR/etc/machine-id"
     mkdir -p "$PROOTFS_DIR/var/lib/dbus"
@@ -293,7 +293,7 @@ UJ
 
 start_xvfb()   { Xvfb "$DISPLAY_NUM" -screen 0 1280x800x24 -nolisten tcp >/tmp/xvfb.log 2>&1 & echo \$! > /tmp/.pid.xvfb; }
 start_x11vnc() { x11vnc -display "$DISPLAY_NUM" -forever -shared -rfbport "$VNC_PORT" -noshm $vnc_extra >/tmp/x11vnc.log 2>&1 & echo \$! > /tmp/.pid.x11vnc; }
-start_ff()     { firefox-esr --no-remote --new-instance -profile "\$PROF" about:blank >/tmp/firefox.log 2>&1 & echo \$! > /tmp/.pid.ff; }
+start_ff()     { pkill -9 -f firefox-esr 2>/dev/null; sleep 1; firefox-esr --no-remote --new-instance -profile "\$PROF" about:blank >/tmp/firefox.log 2>&1 & echo \$! > /tmp/.pid.ff; }
 
 start_xvfb
 sleep 2
