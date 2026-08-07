@@ -267,14 +267,22 @@ create_wrapper() {
     sys_lib="${sys_lib#:}"
     local xroot_export=""
     [[ -n "$xroot_lib" ]] && xroot_export="export LD_LIBRARY_PATH=\"$sys_lib:$xroot_lib:\$LD_LIBRARY_PATH\""
+    # 把 xroot 的 bin 加进 PATH（Xvfb 内部要调 xkbcomp 编译键盘映射；noVNC/FF 也用）
+    local xroot_path_export=""
+    [[ -d "$XROOT/usr/bin" ]] && xroot_path_export="export PATH=\"$XROOT/usr/bin:\$PATH\""
+
+    # XKB 数据在编译期路径(/usr/share/X11/xkb)之外时，必须显式 -xkbdir 指向 xroot
+    local xkbdir_flag=""
+    [[ -d "$XROOT/usr/share/X11/xkb" ]] && xkbdir_flag="-xkbdir $XROOT/usr/share/X11/xkb"
 
     cat > "$wrapper" <<EOF
 #!/bin/bash
 cd "$dir"
 $xroot_export
+$xroot_path_export
 
 start_xvfb() {
-    "$XVFB_BIN" $DISPLAY_NUM -screen 0 1280x800x24 &
+    "$XVFB_BIN" $DISPLAY_NUM -screen 0 1280x800x24 $xkbdir_flag &
     XVFB_PID=\$!
     sleep 2
 }
