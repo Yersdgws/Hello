@@ -244,14 +244,16 @@ create_wrapper() {
     # 无 root 解包目录(xroot)的库路径，注入 wrapper 环境
     local xroot_lib=""
     for d in "$XROOT/usr/lib/"*linux-gnu "$XROOT/usr/lib"; do
-        [[ -d "$d" ]] && xroot_lib="$xroot_lib:$d"
+        [[ -d "$d" ]] && xroot_lib="$xroot_lib:${d}"
     done
-    [[ -n "$xroot_lib" ]] && xroot_lib="export LD_LIBRARY_PATH=\"$xroot_lib\$LD_LIBRARY_PATH\""
+    xroot_lib="${xroot_lib#:}"
+    local xroot_export=""
+    [[ -n "$xroot_lib" ]] && xroot_export="export LD_LIBRARY_PATH=\"$xroot_lib:\$LD_LIBRARY_PATH\""
 
     cat > "$wrapper" <<EOF
 #!/bin/bash
 cd "$dir"
-$xroot_lib
+$xroot_export
 
 start_xvfb() {
     "$XVFB_BIN" $DISPLAY_NUM -screen 0 1280x800x24 &
