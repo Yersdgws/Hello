@@ -207,6 +207,11 @@ ensure_rootfs() {
     # 可写运行时目录（rootfs 归用户所有，容器内 root 写它 = 真实 uid 写）
     mkdir -p "$PROOTFS_DIR/run" "$PROOTFS_DIR/tmp" "$PROOTFS_DIR/root"
 
+    # IPv4 优先: 云开发环境(BAS/K8s)通常无 IPv6 出口, DNS 只回 AAAA 时
+    # firefox/curl 优先连 IPv6 会失败。gai.conf 让 getaddrinfo 优先返回 IPv4。
+    grep -q '::ffff:0:0/96' "$PROOTFS_DIR/etc/gai.conf" 2>/dev/null || \
+        echo 'precedence ::ffff:0:0/96  100' >> "$PROOTFS_DIR/etc/gai.conf"
+
     touch "$marker"
     log_info "rootfs 就绪: $PROOTFS_DIR"
 }
@@ -280,6 +285,11 @@ rm -f /tmp/.pid.xvfb /tmp/.pid.x11vnc /tmp/.pid.ff
 # 固定 profile, 每次全新 → 避免锁/损坏
 PROF=/root/.mozilla/proot-profile
 rm -rf "\$PROF"; mkdir -p "\$PROF"
+# 直连 + IPv4 优先（BAS/云环境无 IPv6 出口; firefox 不读 http_proxy, 默认系统代理=直连）
+cat > "\$PROF/user.js" <<'UJ'
+user_pref("network.dns.disableIPv6", true);
+user_pref("network.proxy.type", 0);
+UJ
 
 start_xvfb()   { Xvfb "$DISPLAY_NUM" -screen 0 1280x800x24 -nolisten tcp >/tmp/xvfb.log 2>&1 & echo \$! > /tmp/.pid.xvfb; }
 start_x11vnc() { x11vnc -display "$DISPLAY_NUM" -forever -shared -rfbport "$VNC_PORT" -noshm $vnc_extra >/tmp/x11vnc.log 2>&1 & echo \$! > /tmp/.pid.x11vnc; }
