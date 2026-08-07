@@ -110,10 +110,39 @@ proot_lib_path() {
 
 install_proot() {
     log_info "安装 proot + libtalloc2 到 $PTOOLS ..."
-    mkdir -p "$PTOOLS" "$(dirname "$PTOOLS")"
+    mkdir -p "$PTOOLS"
     local tmp; tmp=$(mktemp -d)
-    ( cd "$tmp" && apt-get download proot libtalloc2 >/dev/null 2>&1 ) || \
-        log_error "apt-get download proot libtalloc2 失败（检查网络/apt 源）。或已有 root 时直接: apt-get install -y proot"
+    local got=0
+
+    # 方式1: 系统 apt 源（BAS/Ubuntu 常见问题: 缺 universe 或列表过期 → 自动方式2）
+    log_info "尝试 apt-get download ..."
+    if ( cd "$tmp" && apt-get download proot libtalloc2 >"$tmp/apt.log" 2>&1 ); then
+        got=1
+    else
+        log_warn "apt-get download 失败，改用 Debian pool 直连下载（无需 apt 源配置）"
+        log_warn "原因: $(tail -1 "$tmp/apt.log" 2>/dev/null)"
+        # 先试一次 apt-get update 再重试（列表过期场景）
+        if ( cd "$tmp" && apt-get update -qq >/dev/null 2>&1 && apt-get download proot libtalloc2 >"$tmp/apt.log" 2>&1 ); then
+            got=1
+        fi
+    fi
+
+    # 方式2: 直连 deb.debian.org pool（绕过 apt 仓库配置，任何 Debian 系都能用）
+    if [[ "$got" = "0" ]]; then
+        local arch; arch=$(detect_arch)
+        local base="http://deb.debian.org/debian/pool/main"
+        local urls=(
+            "$base/p/proot/proot_5.1.0-1.3_${arch}.deb"
+            "$base/t/talloc/libtalloc2_2.4.0-f2_${arch}.deb"
+        )
+        for u in "${urls[@]}"; do
+            log_info "直连下载: $u"
+            curl -fsSL --retry 3 --retry-delay 2 -o "$tmp/$(basename "$u")" "$u" || log_error "下载失败: $u"
+        done
+        got=1
+    fi
+
+    [[ "$got" = "1" ]] || log_error "proot/libtalloc2 下载失败，请检查网络后重跑"
     for deb in "$tmp"/*.deb; do
         dpkg-deb -x "$deb" "$PTOOLS" 2>/dev/null || log_error "解包失败: $deb"
     done
