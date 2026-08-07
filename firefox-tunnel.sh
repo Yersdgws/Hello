@@ -16,6 +16,10 @@ set -e
 #    bash firefox-tunnel.sh                     # 改端口 + VNC 密码
 #    bash firefox-tunnel.sh --dry-run           # 只打印将要执行的命令
 #
+#  无 root 环境（BAS / 云开发空间）:
+#    bash noroot-deps.sh                        # 装 Xvfb/x11vnc/xkbcomp/GTK 到 ~/xroot
+#    bash firefox-tunnel.sh                     # 自动用 ~/xroot 里的二进制
+#
 # =====================================================================
 
 # ---------- 颜色与日志 ----------
@@ -47,6 +51,7 @@ export XVFB_BIN=${XVFB_BIN:-''}
 export X11VNC_BIN=${X11VNC_BIN:-''}
 export PYTHON3_BIN=${PYTHON3_BIN:-''}
 export XROOT=${XROOT:-"$HOME/xroot"}
+export PROOT_BIN=${PROOT_BIN:-""}
 
 DRY_RUN=0
 [[ "$1" == "--dry-run" ]] && DRY_RUN=1
@@ -179,9 +184,61 @@ EOF
     fi
 }
 
-# ---------- 3. noVNC（网页版 VNC 客户端） ----------
+# ---------- 3. proot（让 Xvfb 找到 /usr/bin/xkbcomp） ----------
+# Xvfb 源码里写死调用 /usr/bin/xkbcomp（无 PATH 回退、无环境变量覆盖）。
+# 无 root 时用 proot 把 ~/xroot/usr/bin/xkbcomp 绑定到 /usr/bin/xkbcomp。
+# proot 由 noroot-deps.sh 通过 apt-get download 装到 ~/xroot/usr/bin/proot。
+ensure_proot() {
+    # 系统本身有 /usr/bin/xkbcomp（root/VPS 环境）→ 不需要 proot
+    if [[ -x /usr/bin/xkbcomp ]]; then
+        log_info "系统已有 /usr/bin/xkbcomp，无需 proot"
+        PROOT_BIN=""
+        return 0
+    fi
+    [[ -x "$PROOT_BIN" ]] && PROOT_BIN_RESOLVED="$PROOT_BIN"
+    [[ -z "$PROOT_BIN_RESOLVED" ]] && command -v proot >/dev/null 2>&1 && PROOT_BIN_RESOLVED=$(command -v proot)
+    [[ -z "$PROOT_BIN_RESOLVED" && -x "$XROOT/usr/bin/proot" ]] && PROOT_BIN_RESOLVED="$XROOT/usr/bin/proot"
+    if [[ -z "$PROOT_BIN_RESOLVED" ]]; then
+        log_warn "未找到 proot，且系统没有 /usr/bin/xkbcomp —— Xvfb 会报键盘错。"
+        log_warn "请先重跑: bash noroot-deps.sh  （会自动装 proot + libtalloc2）"
+        PROOT_BIN=""
+        return 0
+    fi
+    # 自测 proot 能跑（避免坏包/架构不匹配静默失败）
+    if ! "$PROOT_BIN_RESOLVED" --version >/dev/null 2>&1; then
+        log_warn "proot 无法运行: $PROOT_BIN_RESOLVED —— Xvfb 键盘可能失败"
+        PROOT_BIN=""
+        return 0
+    fi
+    PROOT_BIN="$PROOT_BIN_RESOLVED"
+    log_info "proot: $PROOT_BIN"
+}
+
+# ---------- 4. noVNC（网页版 VNC 客户端）+ websockify ----------
+# 注意：noVNC 官方发布 tarball 里【不含】websockify（git 子模块），
+# 必须单独下载 websockify 放到 $NOVNC_DIR/utils/websockify/。
+ensure_websockify() {
+    if [[ -x "$NOVNC_DIR/utils/websockify/run" ]]; then
+        log_info "websockify: $NOVNC_DIR/utils/websockify"
+        return 0
+    fi
+    local tmp; tmp=$(mktemp -d)
+    local url="https://github.com/novnc/websockify/archive/refs/tags/v0.12.0.tar.gz"
+    log_info "下载 websockify（noVNC 发布包不含它，需单独拉）..."
+    if curl -fsSL --retry 3 -o "$tmp/ws.tar.gz" "$url"; then
+        tar -xzf "$tmp/ws.tar.gz" -C "$tmp"
+        mkdir -p "$NOVNC_DIR/utils"
+        rm -rf "$NOVNC_DIR/utils/websockify"
+        cp -r "$tmp"/websockify-0.12.0 "$NOVNC_DIR/utils/websockify"
+    fi
+    rm -rf "$tmp"
+    [[ -x "$NOVNC_DIR/utils/websockify/run" ]] || log_error "websockify 下载失败: $url"
+    log_info "websockify 就绪: $NOVNC_DIR/utils/websockify"
+}
+
 ensure_novnc() {
-    if [[ -f "$NOVNC_DIR/vnc.html" && -f "$NOVNC_DIR/utils/websockify.py" ]]; then
+    # 校验：vnc.html（noVNC 本体）+ utils/websockify/run（websockify）
+    if [[ -f "$NOVNC_DIR/vnc.html" && -x "$NOVNC_DIR/utils/websockify/run" ]]; then
         log_info "noVNC: $NOVNC_DIR"
         return 0
     fi
@@ -202,10 +259,11 @@ ensure_novnc() {
     chmod +x "$NOVNC_DIR/utils/launch.sh" 2>/dev/null || true
     [[ -f "$NOVNC_DIR/vnc.html" ]] || log_error "noVNC 目录不完整: $NOVNC_DIR"
     rm -rf "$tmp"
+    ensure_websockify
     log_info "noVNC 就绪: $NOVNC_DIR"
 }
 
-# ---------- 4. cloudflared ----------
+# ---------- 5. cloudflared ----------
 ensure_cloudflared() {
     [[ -x "$CF_BIN" ]] && { log_info "cloudflared: $CF_BIN"; return 0; }
     local arch="$1" os="$2"
@@ -215,7 +273,7 @@ ensure_cloudflared() {
     chmod +x "$CF_BIN"
 }
 
-# ---------- 5. 构建 cloudflared 隧道参数（同 gotty.sh 逻辑） ----------
+# ---------- 6. 构建 cloudflared 隧道参数（同 gotty.sh 逻辑） ----------
 build_tunnel_args() {
     local gotty_port="$1"
 
@@ -242,7 +300,7 @@ build_tunnel_args() {
     fi
 }
 
-# ---------- 6. 生成自守护启动脚本（任一进程退出自动重启） ----------
+# ---------- 7. 生成自守护启动脚本（任一进程退出自动重启） ----------
 create_wrapper() {
     local dir="$(pwd)"
     local tunnel_args=$(build_tunnel_args "$ARGO_PORT")
@@ -254,7 +312,7 @@ create_wrapper() {
     # 无 root 解包目录(xroot)的库路径。
     # 关键：系统库目录放前面，xroot 放后面——系统已有的库用系统的（避免
     # bookworm 旧版 libssl 等遮蔽系统新版导致 curl/动态库崩溃），
-    # xroot 只补系统没有的（libvncserver、libunwind 等）。
+    # xroot 只补系统没有的（libvncserver、libunwind、GTK 等）。
     local xroot_lib=""
     for d in "$XROOT/usr/lib/"*linux-gnu "$XROOT/usr/lib"; do
         [[ -d "$d" ]] && xroot_lib="$xroot_lib:${d}"
@@ -267,13 +325,19 @@ create_wrapper() {
     sys_lib="${sys_lib#:}"
     local xroot_export=""
     [[ -n "$xroot_lib" ]] && xroot_export="export LD_LIBRARY_PATH=\"$sys_lib:$xroot_lib:\$LD_LIBRARY_PATH\""
-    # 把 xroot 的 bin 加进 PATH（Xvfb 内部要调 xkbcomp 编译键盘映射；noVNC/FF 也用）
+    # 把 xroot 的 bin 加进 PATH（xkbcomp/noVNC/FF 也可能要用）
     local xroot_path_export=""
     [[ -d "$XROOT/usr/bin" ]] && xroot_path_export="export PATH=\"$XROOT/usr/bin:\$PATH\""
 
     # XKB 数据在编译期路径(/usr/share/X11/xkb)之外时，必须显式 -xkbdir 指向 xroot
     local xkbdir_flag=""
     [[ -d "$XROOT/usr/share/X11/xkb" ]] && xkbdir_flag="-xkbdir $XROOT/usr/share/X11/xkb"
+
+    # Xvfb 写死找 /usr/bin/xkbcomp → 用 proot -b 把 xroot 的 xkbcomp 绑定到该路径
+    local xvfb_cmd="$XVFB_BIN $DISPLAY_NUM -screen 0 1280x800x24 $xkbdir_flag"
+    if [[ -n "$PROOT_BIN" && -x "$XROOT/usr/bin/xkbcomp" && ! -x /usr/bin/xkbcomp ]]; then
+        xvfb_cmd="$PROOT_BIN -b $XROOT/usr/bin/xkbcomp:/usr/bin/xkbcomp -- $XVFB_BIN $DISPLAY_NUM -screen 0 1280x800x24 $xkbdir_flag"
+    fi
 
     cat > "$wrapper" <<EOF
 #!/bin/bash
@@ -282,9 +346,9 @@ $xroot_export
 $xroot_path_export
 
 start_xvfb() {
-    "$XVFB_BIN" $DISPLAY_NUM -screen 0 1280x800x24 $xkbdir_flag &
+    $xvfb_cmd &
     XVFB_PID=\$!
-    sleep 2
+    sleep 4
 }
 
 start_x11vnc() {
@@ -293,16 +357,28 @@ start_x11vnc() {
 }
 
 start_novnc() {
-    if [[ -x "$NOVNC_DIR/utils/launch.sh" ]]; then
-        "$NOVNC_DIR/utils/launch.sh" --vnc localhost:$VNC_PORT --listen $ARGO_PORT &
-    else
-        "$PYTHON3_BIN" "$NOVNC_DIR/utils/websockify.py" --web="$NOVNC_DIR" $ARGO_PORT localhost:$VNC_PORT &
-    fi
+    # websockify 在 noVNC 发布包里不存在，已由 ensure_websockify 装到 utils/websockify/
+    ( cd "$NOVNC_DIR/utils/websockify" && exec "$PYTHON3_BIN" -m websockify --web="$NOVNC_DIR" "$ARGO_PORT" localhost:"$VNC_PORT" ) &
     NOVNC_PID=\$!
 }
 
+check_firefox_libs() {
+    # 体检 Firefox 的依赖是否齐全（缺 GTK 等会直接起不来）
+    local out
+    out=\$(LD_LIBRARY_PATH="\$LD_LIBRARY_PATH" ldd "\$FIREFOX_BIN" 2>/dev/null | grep -E "not found" || true)
+    if [[ -n "\$out" ]]; then
+        echo "\$(date '+%F %T') [WARN] Firefox 依赖缺失:"
+        echo "\$out" | sed 's/^/      /'
+        echo "      → 在会话里重跑: bash noroot-deps.sh ，然后重启本脚本"
+    fi
+    if echo "\$out" | grep -q -i "gtk"; then
+        echo "\$(date '+%F %T') [ERROR] 缺 GTK 库，Firefox 无法启动。请先: bash noroot-deps.sh"
+    fi
+}
+
 start_firefox() {
-    DISPLAY=$DISPLAY_NUM "$FIREFOX_BIN" --no-remote --new-instance about:blank &
+    check_firefox_libs
+    DISPLAY=$DISPLAY_NUM "\$FIREFOX_BIN" --no-remote --new-instance about:blank &
     FIREFOX_PID=\$!
 }
 
@@ -350,6 +426,7 @@ log_info "系统: $OS / $ARCH"
 
 ensure_firefox
 ensure_tools
+ensure_proot
 ensure_novnc
 ensure_cloudflared "$ARCH" "$OS"
 
