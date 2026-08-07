@@ -16,7 +16,6 @@ set -e
 #    bash firefox-tunnel.sh                     # 改端口 + VNC 密码
 #    bash firefox-tunnel.sh --dry-run           # 只打印将要执行的命令
 #
-
 # =====================================================================
 
 # ---------- 颜色与日志 ----------
@@ -42,6 +41,12 @@ export FIREFOX_BIN=${FIREFOX_BIN:-"$HOME/firefox/firefox"}
 export FIREFOX_LANG=${FIREFOX_LANG:-'en-US'}
 export NOVNC_DIR=${NOVNC_DIR:-"$HOME/noVNC"}
 export CF_BIN=${CF_BIN:-"$HOME/cloudflared"}
+
+# 二进制路径覆盖（无 root 环境用 noroot-deps.sh 装到 ~/xroot 后指到这里）
+export XVFB_BIN=${XVFB_BIN:-''}
+export X11VNC_BIN=${X11VNC_BIN:-''}
+export PYTHON3_BIN=${PYTHON3_BIN:-''}
+export XROOT=${XROOT:-"$HOME/xroot"}
 
 DRY_RUN=0
 [[ "$1" == "--dry-run" ]] && DRY_RUN=1
@@ -109,25 +114,68 @@ ensure_firefox() {
 }
 
 # ---------- 2. 组件检测/安装 (xvfb, x11vnc, python3) ----------
+# 解析顺序: 环境变量 > PATH > ~/xroot(无root解包目录) > apt(root)
+resolve_bin() {
+    local var_name="$1" default_name="$2" xroot_path="$3"
+    local val="${!var_name}"
+    if [[ -n "$val" && -x "$val" ]]; then
+        eval "$var_name='$val'"; return 0
+    fi
+    if command -v "$default_name" >/dev/null 2>&1; then
+        eval "$var_name='$(command -v "$default_name")'"; return 0
+    fi
+    if [[ -x "$xroot_path" ]]; then
+        eval "$var_name='$xroot_path'"; return 0
+    fi
+    eval "$var_name=''"
+    return 1
+}
+
 ensure_tools() {
+    # 尝试找二进制
+    resolve_bin XVFB_BIN   Xvfb   "$XROOT/usr/bin/Xvfb"   || true
+    resolve_bin X11VNC_BIN x11vnc "$XROOT/usr/bin/x11vnc" || true
+    resolve_bin PYTHON3_BIN python3 "$XROOT/usr/bin/python3" || true
+
     local missing=()
-    command -v Xvfb   >/dev/null 2>&1 || missing+=(xvfb)
-    command -v x11vnc >/dev/null 2>&1 || missing+=(x11vnc)
-    command -v python3 >/dev/null 2>&1 || missing+=(python3)
+    [[ -n "$XVFB_BIN" ]]   || missing+=(xvfb)
+    [[ -n "$X11VNC_BIN" ]] || missing+=(x11vnc)
+    [[ -n "$PYTHON3_BIN" ]] || missing+=(python3)
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        log_warn "缺少组件: ${missing[*]}，尝试 apt 安装..."
-        if command -v apt-get >/dev/null 2>&1; then
+        log_warn "缺少组件: ${missing[*]}，尝试安装..."
+        # 有 root/sudo → apt
+        if command -v apt-get >/dev/null 2>&1 && { [[ $EUID -eq 0 ]] || command -v sudo >/dev/null 2>&1; }; then
             if [[ $EUID -eq 0 ]]; then
                 apt-get update -qq && apt-get install -y "${missing[@]}"
-            elif command -v sudo >/dev/null 2>&1; then
-                sudo apt-get update -qq && sudo apt-get install -y "${missing[@]}"
             else
-                log_error "无 root/sudo，无法安装 ${missing[*]}，请手动安装"
+                sudo apt-get update -qq && sudo apt-get install -y "${missing[@]}"
             fi
-        else
-            log_error "无 apt，请手动安装: ${missing[*]}"
         fi
+        # 再查一次
+        [[ -x "$XVFB_BIN" ]]   || [[ -n "$XVFB_BIN" && -x "$(command -v Xvfb 2>/dev/null)" ]] || resolve_bin XVFB_BIN Xvfb "$XROOT/usr/bin/Xvfb" || true
+        [[ -n "$XVFB_BIN" ]]   || missing_xvfb=1
+        [[ -n "$X11VNC_BIN" ]] || missing_x11vnc=1
+        [[ -n "$PYTHON3_BIN" ]] || missing_python3=1
+        if [[ "$missing_xvfb" = "1" || "$missing_x11vnc" = "1" || "$missing_python3" = "1" ]]; then
+            cat >&2 <<'EOF'
+${RED}[ERROR]${NC} 仍缺少 Xvfb/x11vnc/python3，且无 root/sudo 无法 apt 安装。
+
+无 root 环境请用同目录的 noroot-deps.sh（apt-get download + 解包 .deb 到 ~/xroot）：
+    bash noroot-deps.sh
+    export LD_LIBRARY_PATH="$HOME/xroot/usr/lib/x86_64-linux-gnu:$HOME/xroot/usr/lib:$LD_LIBRARY_PATH"
+    export PATH="$HOME/xroot/usr/bin:$PATH"
+
+然后指定二进制路径重跑：
+    XVFB_BIN=~/xroot/usr/bin/Xvfb X11VNC_BIN=~/xroot/usr/bin/x11vnc \\
+    PYTHON3_BIN=$(command -v python3) bash firefox-tunnel.sh
+
+如果你其实有 root（VPS/本机），直接 sudo 装: apt-get install -y xvfb x11vnc python3
+EOF
+            log_error "缺少 ${missing[*]}（详见上方说明）"
+        fi
+    else
+        log_info "Xvfb=$XVFB_BIN x11vnc=$X11VNC_BIN python3=$PYTHON3_BIN"
     fi
 }
 
@@ -190,15 +238,23 @@ create_wrapper() {
     local tunnel_args=$(build_tunnel_args "$ARGO_PORT")
     local wrapper="$dir/.firefox-tunnel-wrapper.sh"
 
-    local x11vnc_cmd="x11vnc -display $DISPLAY_NUM -forever -shared -rfbport $VNC_PORT -nopw"
-    [[ -n "$VNC_PASSWORD" ]] && x11vnc_cmd="x11vnc -display $DISPLAY_NUM -forever -shared -rfbport $VNC_PORT -passwd '$VNC_PASSWORD'"
+    local x11vnc_cmd="$X11VNC_BIN -display $DISPLAY_NUM -forever -shared -rfbport $VNC_PORT -nopw"
+    [[ -n "$VNC_PASSWORD" ]] && x11vnc_cmd="$X11VNC_BIN -display $DISPLAY_NUM -forever -shared -rfbport $VNC_PORT -passwd '$VNC_PASSWORD'"
+
+    # 无 root 解包目录(xroot)的库路径，注入 wrapper 环境
+    local xroot_lib=""
+    for d in "$XROOT/usr/lib/"*linux-gnu "$XROOT/usr/lib"; do
+        [[ -d "$d" ]] && xroot_lib="$xroot_lib:$d"
+    done
+    [[ -n "$xroot_lib" ]] && xroot_lib="export LD_LIBRARY_PATH=\"$xroot_lib\$LD_LIBRARY_PATH\""
 
     cat > "$wrapper" <<EOF
 #!/bin/bash
 cd "$dir"
+$xroot_lib
 
 start_xvfb() {
-    Xvfb $DISPLAY_NUM -screen 0 1280x800x24 &
+    "$XVFB_BIN" $DISPLAY_NUM -screen 0 1280x800x24 &
     XVFB_PID=\$!
     sleep 2
 }
@@ -212,7 +268,7 @@ start_novnc() {
     if [[ -x "$NOVNC_DIR/utils/launch.sh" ]]; then
         "$NOVNC_DIR/utils/launch.sh" --vnc localhost:$VNC_PORT --listen $ARGO_PORT &
     else
-        python3 "$NOVNC_DIR/utils/websockify.py" --web="$NOVNC_DIR" $ARGO_PORT localhost:$VNC_PORT &
+        "$PYTHON3_BIN" "$NOVNC_DIR/utils/websockify.py" --web="$NOVNC_DIR" $ARGO_PORT localhost:$VNC_PORT &
     fi
     NOVNC_PID=\$!
 }
