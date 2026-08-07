@@ -29,7 +29,8 @@ cd "$TMP"
 
 # 种子包：闭包会递归补齐全部依赖
 SEEDS="xvfb x11vnc xauth x11-xkb-utils xkb-data x11-utils fontconfig fonts-dejavu-core \
-       libgtk-3-0 libpangocairo-1.0-0 libasound2 libdbus-glib-1-2 libnss3 libnspr4"
+       libgtk-3-0 libpangocairo-1.0-0 libasound2 libdbus-glib-1-2 libnss3 libnspr4 \
+       proot libtalloc2"
 
 # 不下载的系统核心库：直接用容器自带的，避免 glibc/编译器运行时版本冲突
 SKIP="libc6 libgcc-s1 libstdc++6 libgomp1 libitm1 libatomic1 libquadmath0 \
@@ -40,11 +41,15 @@ MISSING=""
 DL_COUNT=0
 
 dl() {
-    local p="$1"
-    if apt-get "${APT_OPTS[@]}" download "$p" >/dev/null 2>&1; then
-        DL_COUNT=$((DL_COUNT+1))
-        return 0
-    fi
+    local p="$1" n
+    # 网络抖动重试 3 次；连续失败才算缺失（否则会静默漏装 GTK 等关键包）
+    for n in 1 2 3; do
+        if apt-get "${APT_OPTS[@]}" download "$p" >/dev/null 2>&1; then
+            DL_COUNT=$((DL_COUNT+1))
+            return 0
+        fi
+        sleep 2
+    done
     return 1
 }
 
@@ -148,6 +153,27 @@ for f in *.deb; do
 done
 [[ "$FOUND" = "0" ]] && log_error "没有下到任何 .deb，请检查网络"
 
+# ---------- 关键文件体检（缺一个都起不来，直接报错并指出重跑） ----------
+BIN_MISS=""
+for b in Xvfb x11vnc xkbcomp; do
+    [[ -x "$PREFIX/usr/bin/$b" ]] || BIN_MISS="$BIN_MISS $b"
+done
+# proot：仅当系统没有 /usr/bin/xkbcomp 时需要（Xvfb 写死找 /usr/bin/xkbcomp）
+if [[ ! -x /usr/bin/xkbcomp && ! -x "$PREFIX/usr/bin/proot" ]]; then
+    log_warn "系统无 /usr/bin/xkbcomp 且 xroot 未装 proot —— Xvfb 启动会报键盘错，请重跑本脚本"
+fi
+LIB_MISS=""
+for l in libgtk-3.so.0 libasound.so.2 libnss3.so libnspr4.so; do
+    # 系统里有也算有（会在 LD_LIBRARY_PATH 前面被用到）
+    [[ -e "/usr/lib/x86_64-linux-gnu/$l" || -e "/lib/x86_64-linux-gnu/$l" ]] && continue
+    find "$PREFIX" -name "$l" -print -quit 2>/dev/null | grep -q . || LIB_MISS="$LIB_MISS $l"
+done
+echo
+log_info "关键文件体检..."
+[[ -n "$BIN_MISS" ]] && log_error "缺失关键二进制:$BIN_MISS —— 请检查网络后重跑本脚本"
+[[ -n "$LIB_MISS" ]] && log_error "缺失关键库文件:$LIB_MISS —— 请重跑本脚本（下载已加重试）"
+echo "  Xvfb/x11vnc/xkbcomp + GTK/ALSA/NSS 全部就绪 ✓"
+
 # ---------- 缺失库体检 ----------
 LIBDIR=""
 for d in "$PREFIX/usr/lib/"*linux-gnu; do
@@ -188,3 +214,6 @@ echo "XVFB_BIN=\"$PREFIX/usr/bin/Xvfb\" \\"
 echo "X11VNC_BIN=\"$PREFIX/usr/bin/x11vnc\" \\"
 echo "PYTHON3_BIN=\"\$(command -v python3)\" \\"
 echo "bash firefox-tunnel.sh"
+echo
+echo "# Xvfb 写死找 /usr/bin/xkbcomp；无 root 时 firefox-tunnel.sh 自动用"
+echo "# 本脚本装的 proot 把 $PREFIX/usr/bin/xkbcomp 绑定到 /usr/bin/xkbcomp。无需你手动操作。"
